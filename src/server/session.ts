@@ -20,6 +20,7 @@ import {
     concatenate,
     createQueue,
     createSet,
+    createSourceFile,
     createTextSpan,
     createTextSpanFromBounds,
     Debug,
@@ -47,6 +48,7 @@ import {
     flatMap,
     flatMapToMutable,
     flattenDiagnosticMessageText,
+    forEachChild,
     forEachNameInAccessChainWalkingLeft,
     FormatCodeSettings,
     formatting,
@@ -63,6 +65,7 @@ import {
     getNormalizedAbsolutePath,
     getPackageNameFromTypesPackageName,
     getPackageScopeForPath,
+    getPositionOfLineAndCharacter,
     getSnapshotText,
     getSupportedCodeFixes,
     getTemporaryModuleResolutionState,
@@ -77,6 +80,7 @@ import {
     isArray,
     isDeclarationFileName,
     isIdentifier,
+    isImportDeclaration,
     isString,
     isStringLiteralLike,
     JSDocLinkDisplayPart,
@@ -90,11 +94,13 @@ import {
     mapIterator,
     mapOneOrMany,
     memoize,
+    ModuleResolutionHost,
     ModuleResolutionKind,
     MultiMap,
     NavigateToItem,
     NavigationBarItem,
     NavigationTree,
+    Node,
     nodeModulesPathPart,
     normalizePath,
     OperationCanceledException,
@@ -115,7 +121,9 @@ import {
     removeFileExtension,
     RenameInfo,
     RenameLocation,
+    resolveModuleName,
     ScriptKind,
+    ScriptTarget,
     SelectionRange,
     SemanticClassificationFormat,
     SignatureHelpItem,
@@ -124,6 +132,7 @@ import {
     some,
     SourceFile,
     startsWith,
+    StringLiteral,
     SymbolDisplayPart,
     SyntaxKind,
     TextChange,
@@ -1534,6 +1543,101 @@ export class Session<TMessage = string> implements EventSender {
         };
     }
 
+    private createBundleFile(sourceFile: string): { bundleFile: NormalizedPath, mapping: BundleMapping[], disposeBundleInfo: () => void, bundleInfo: ScriptInfo } {
+        const _this = this;
+        const sourceFilePath = toNormalizedPath(sourceFile);
+        const dependenciesSet: NormalizedPath[] = [];
+        const mapping: BundleMapping[] = [];
+        const bundleFile = toNormalizedPath((this.projectService.getDefaultProjectForFile(sourceFilePath, true)!).currentDirectory + "/node_modules/@types/WGLScript/plug.d.js");
+
+        const bundleInfo = this.projectService.getOrCreateScriptInfoForNormalizedPath(
+            bundleFile,
+            /*openedByClient*/ false,
+            /*fileContent*/ undefined,
+            ScriptKind.TS
+        )!;
+        
+        bundleInfo.editContent(0, (bundleInfo.getSnapshot()).getLength(), resolveModulesContent(sourceFilePath, 0, 0, 0));
+        
+        const project = this.projectService.getDefaultProjectForFile(sourceFilePath, true)!;
+        project.addRoot(bundleInfo);
+    
+        function resolveModulesContent(moduleFile: NormalizedPath, position: number, importSize: number, importPosition: number, parentModule?: NormalizedPath): string {
+            if (dependenciesSet.some(d => d === moduleFile)) return "";
+            dependenciesSet.push(moduleFile);
+    
+            const sourceInfo = _this.getScriptInfoFromProjectService(moduleFile);
+            const dependencies = getDependencies(moduleFile);
+    
+            let content = (sourceInfo.getSnapshot()).getText(0, (sourceInfo.getSnapshot()).getLength());
+            let resolvePositionOffset = 0;
+    
+            dependencies.sort((a, b) => a.importStartPosition - b.importStartPosition);
+            for (let dep of dependencies) {
+                const start = dep.importStartPosition + resolvePositionOffset;
+                content = removeSubstring(content, start, dep.importSize);
+                resolvePositionOffset -= dep.importSize;
+                const dependencyContent = resolveModulesContent(dep.moduleFile, position + start, dep.importSize, dep.importStartPosition, moduleFile);
+                content = insertString(content, dependencyContent, start);
+                resolvePositionOffset += dependencyContent.length;
+            }
+    
+            // Store the mapping position for this module
+            mapping.push({
+                module: moduleFile.toLocaleLowerCase(),
+                parentModule: parentModule?.toLocaleLowerCase() || "",
+                resolvedModulePosition: position,
+                resolvedModuleSize: content.length,
+                importSize: importSize,
+                importPosition: importPosition,
+            });
+    
+            return content;
+        }
+    
+        function removeSubstring(originalString: string, position: number, count: number): string {
+            const part1 = originalString.slice(0, position);
+            const part2 = originalString.slice(position + count);
+            return part1 + part2;
+        }
+    
+        function insertString(originalString: string, insertString: string, position: number): string {
+            const part1 = originalString.slice(0, position);
+            const part2 = originalString.slice(position);
+            return part1 + insertString + part2;
+        }
+    
+        function getDependencies(moduleFile: string): Dependency[] {
+            const project = (_this.getScriptInfoFromProjectService(moduleFile)).getDefaultProject();
+            const program = project.getLanguageService().getProgram()!;
+            const sourceFile = program.getSourceFile(moduleFile)!;
+            const dependencies: Dependency[] = [];
+    
+            const visit = (node: Node) => {
+                if (isImportDeclaration(node)) {
+                    const start = node.getStart();
+                    const width = node.getWidth();
+    
+                    const moduleName = (node.moduleSpecifier as StringLiteral).text;
+                    const resolvedModule = resolveModuleName(moduleName, moduleFile, project.getCompilerOptions(), _this.projectService.host as ModuleResolutionHost).resolvedModule;
+    
+                    if (resolvedModule) dependencies.push({
+                        moduleFile: toNormalizedPath(resolvedModule.resolvedFileName),
+                        importStartPosition: start,
+                        importSize: width,
+                    });
+    
+                }
+                forEachChild(node, visit);
+            };
+            forEachChild(sourceFile, visit);
+    
+            return dependencies;
+        }
+    
+        return { bundleFile, mapping, disposeBundleInfo: () => project.removeFile(bundleInfo, true, true), bundleInfo };
+    }
+    
     private findSourceDefinition(args: protocol.FileLocationRequestArgs): readonly protocol.DefinitionInfo[] {
         const { file, project } = this.getFileAndProject(args);
         const position = this.getPositionInFile(args, file);
@@ -3307,19 +3411,144 @@ export class Session<TMessage = string> implements EventSender {
             return this.notRequired();
         },
         [protocol.CommandTypes.Definition]: (request: protocol.DefinitionRequest) => {
-            return this.requiredResponse(this.getDefinition(request.arguments, /*simplifiedResult*/ true));
+            const response = this.getDefinition(request.arguments, /*simplifiedResult*/ true);
+            this.logger.info("||| Definition: " + JSON.stringify(response))
+            return this.requiredResponse(response);
         },
         [protocol.CommandTypes.DefinitionFull]: (request: protocol.DefinitionRequest) => {
-            return this.requiredResponse(this.getDefinition(request.arguments, /*simplifiedResult*/ false));
+            const response = this.getDefinition(request.arguments, /*simplifiedResult*/ false);
+            this.logger.info("||| DefinitionFull: " + JSON.stringify(response))
+            return this.requiredResponse(response);
         },
         [protocol.CommandTypes.DefinitionAndBoundSpan]: (request: protocol.DefinitionAndBoundSpanRequest) => {
-            return this.requiredResponse(this.getDefinitionAndBoundSpan(request.arguments, /*simplifiedResult*/ true));
+            const response = this.getDefinitionAndBoundSpan(request.arguments, /*simplifiedResult*/ true);
+            this.logger.info("||| DefinitionAndBoundSpan: " + JSON.stringify(response))
+            return this.requiredResponse(response);
         },
         [protocol.CommandTypes.DefinitionAndBoundSpanFull]: (request: protocol.DefinitionAndBoundSpanRequest) => {
-            return this.requiredResponse(this.getDefinitionAndBoundSpan(request.arguments, /*simplifiedResult*/ false));
+            const response = this.getDefinitionAndBoundSpan(request.arguments, /*simplifiedResult*/ false);
+            this.logger.info("||| DefinitionAndBoundSpanFull: " + JSON.stringify(response))
+            return this.requiredResponse(response);
         },
         [protocol.CommandTypes.FindSourceDefinition]: (request: protocol.FindSourceDefinitionRequest) => {
-            return this.requiredResponse(this.findSourceDefinition(request.arguments));
+            const _this = this;
+            // бандл файл (зарезолвенный исходный файл)
+            const { bundleFile, mapping, bundleInfo, disposeBundleInfo } = this.createBundleFile(request.arguments.file);
+            this.logger.info("||| mapping: " + JSON.stringify(mapping));
+            const bundleContent = (bundleInfo.getSnapshot()).getText(0, (bundleInfo.getSnapshot()).getLength());    
+            this.logger.info("||| bundleContent:\r\n" + bundleContent);
+        
+            // исходный файл
+            const sourceInfo = this.getScriptInfoFromProjectService(request.arguments.file);
+            const sourceContent = (sourceInfo.getSnapshot()).getText(0, (sourceInfo.getSnapshot()).getLength());    
+        
+            // Получение позиции в исходном файле
+            // const nativeRequestPosition = this.getPosition(request.arguments, sourceInfo);
+            // this.logger.info("||| nativeRequestPosition: " + JSON.stringify(nativeRequestPosition));
+            // const nativeRequestPosition2 = getPositionOfLineAndCharacter(createSourceFile(request.arguments.file, sourceContent, ScriptTarget.Latest), request.arguments.line, request.arguments.offset);
+            // this.logger.info("||| nativeRequestPosition2: " + JSON.stringify(nativeRequestPosition2));
+            
+            const sourceRequestPosition = customGetPositionOfLineAndCharacter(sourceContent, request.arguments.line, request.arguments.offset);
+            this.logger.info("||| sourceRequestPosition: " + JSON.stringify(sourceRequestPosition));
+        
+            // Получение позиции в бандле
+            const bundleRequestPosition = getBundlePosition(mapping, toNormalizedPath(sourceInfo.path), sourceRequestPosition);
+            this.logger.info("||| bundleRequestPosition: " + JSON.stringify(bundleRequestPosition));
+        
+            const bundleRequestLineAndCharacter = getLineAndCharacterOfPosition(createSourceFile(bundleFile, bundleContent, ScriptTarget.Latest), bundleRequestPosition);
+            bundleRequestLineAndCharacter.character += 1;
+            bundleRequestLineAndCharacter.line += 1;
+            
+            const bundleRequestArguments: protocol.FileLocationRequestArgs = {
+                file: bundleFile,
+                line: bundleRequestLineAndCharacter.line,
+                // offset: bundleLineAndCharacter.character,
+                offset: request.arguments.offset,
+                projectFileName: request.arguments.projectFileName
+            };
+            this.logger.info("||| bundleRequestArguments: " + JSON.stringify(bundleRequestArguments));
+
+            const bundleDefinitions = this.findSourceDefinition(bundleRequestArguments);
+            this.logger.info("||| bundleDefinitions: " + JSON.stringify(bundleDefinitions));
+            disposeBundleInfo();
+
+            bundleDefinitions.forEach(d => {
+                _this.logger.info("$$$bundleDefinitions d: " + JSON.stringify(d));
+                const startLocationInfo = shiftSourceLocation(d.start);
+                if (d.file === bundleFile) {
+                    d.file = startLocationInfo.file;
+                    d.start = startLocationInfo.location;
+                    d.end = shiftSourceLocation(d.end).location;
+                    if (d.contextEnd) d.contextEnd = shiftSourceLocation(d.contextEnd).location;
+                    if (d.contextStart) d.contextStart = shiftSourceLocation(d.contextStart).location;
+                }
+            });
+            this.logger.info("||| bundleDefinitionsInSource: " + JSON.stringify(bundleDefinitions));
+
+            const response = bundleDefinitions;
+
+            function shiftSourceLocation(location: protocol.Location): {location: protocol.Location, file: NormalizedPath} {
+                const position = customGetPositionOfLineAndCharacter(bundleContent, location.line, location.offset);
+                _this.logger.info("$$$shiftSourceLocation position: " + JSON.stringify(position));
+                const {position: moduleResponsePosition, module } = getSourcePosition(mapping, position);
+                _this.logger.info("$$$shiftSourceLocation moduleResponsePosition: " + JSON.stringify(moduleResponsePosition));
+                const moduleInfo = _this.getScriptInfoFromProjectService(module);
+                const moduleContent = (moduleInfo.getSnapshot()).getText(0, (moduleInfo.getSnapshot()).getLength());    
+    
+                const moduleLocation = getLineAndCharacterOfPosition(createSourceFile(module, moduleContent, ScriptTarget.Latest), moduleResponsePosition);
+                moduleLocation.character += 1;
+                moduleLocation.line += 1;
+                _this.logger.info("$$$shiftSourceLocation moduleLocation: " + JSON.stringify(moduleLocation));
+
+                return {
+                    location: {
+                        line: moduleLocation.line,
+                        offset: moduleLocation.character,
+                    },
+                    file: module
+                }
+            }
+    
+            function getBundlePosition(mapping: BundleMapping[], sourceFile: NormalizedPath, sourcePosition: number): number {
+                const target = mapping.find(m => m.module === sourceFile.toLocaleLowerCase())!;
+                _this.logger.info("$$$getBundlePosition target: " + JSON.stringify(target));
+                const dependenciesUnderPosition = mapping.filter(m => m.parentModule === target.module && m.importPosition < sourcePosition);
+                _this.logger.info("$$$getBundlePosition dependenciesUnderPosition: " + JSON.stringify(dependenciesUnderPosition));
+                let shiftBundlePosition = 0;
+                dependenciesUnderPosition.forEach(d => {
+                    shiftBundlePosition = shiftBundlePosition - d.importSize + d.resolvedModuleSize;
+                    _this.logger.info("$$$getBundlePosition dependenciesUnderPosition.forEach: " + JSON.stringify(d));
+                });
+                _this.logger.info("$$$getBundlePosition shiftBundlePosition: " + JSON.stringify(shiftBundlePosition));
+                const bundlePosition = sourcePosition + shiftBundlePosition;
+                _this.logger.info("$$$getBundlePosition bundlePosition: " + JSON.stringify(bundlePosition));
+                return bundlePosition;
+            }
+
+            function getSourcePosition(mapping: BundleMapping[], bundlePosition: number): {position: number, module: NormalizedPath} {
+                let shiftSourcePosition = 0;
+
+                const dependenciesAroundPosition = mapping.filter(m => m.resolvedModulePosition < bundlePosition && m.resolvedModulePosition + m.resolvedModuleSize > bundlePosition);
+                _this.logger.info("$$$getSourcePosition dependenciesAroundPosition: " + JSON.stringify(dependenciesAroundPosition));
+
+                const targetSourceFile = dependenciesAroundPosition.sort((d1, d2) => (d1.resolvedModulePosition + d1.resolvedModuleSize) - (d2.resolvedModulePosition + d2.resolvedModuleSize))[0];
+                _this.logger.info("$$$getSourcePosition targetSourceFile: " + JSON.stringify(targetSourceFile));
+                shiftSourcePosition = shiftSourcePosition - targetSourceFile.resolvedModulePosition;
+
+                const dependenciesUnderTargetSourceFilePosition = mapping.filter(d => d.parentModule === targetSourceFile.module && d.resolvedModulePosition + d.resolvedModuleSize < bundlePosition);
+                _this.logger.info("$$$getSourcePosition dependenciesUnderTargetSourceFilePosition: " + JSON.stringify(dependenciesUnderTargetSourceFilePosition));
+                dependenciesUnderTargetSourceFilePosition.forEach(d => shiftSourcePosition = shiftSourcePosition - d.resolvedModuleSize + d.importSize);
+                
+                const sourcePosition = bundlePosition + shiftSourcePosition;
+                _this.logger.info("$$$getSourcePosition sourcePosition: " + JSON.stringify(sourcePosition));
+                return {position: sourcePosition, module: toNormalizedPath(targetSourceFile.module)};
+            }
+
+            function customGetPositionOfLineAndCharacter(content: string, line: number, character: number): number {
+                return content.split("\r\n").slice(0, line - 1).join("\r\n").length + character + 1;
+            }       
+                        
+            return this.requiredResponse(response);
         },
         [protocol.CommandTypes.EmitOutput]: (request: protocol.EmitOutputRequest) => {
             return this.requiredResponse(this.getEmitOutput(request.arguments));
@@ -3879,4 +4108,19 @@ function isCompletionEntryData(data: any): data is CompletionEntryData {
             && (data.fileName === undefined || typeof data.fileName === "string")
             && (data.ambientModuleName === undefined || typeof data.ambientModuleName === "string"
                     && (data.isPackageJsonImport === undefined || typeof data.isPackageJsonImport === "boolean"));
+}
+
+interface Dependency {
+    moduleFile: NormalizedPath, 
+    importSize: number,
+    importStartPosition: number, 
+};
+
+interface BundleMapping {
+    resolvedModulePosition: number, 
+    resolvedModuleSize: number,
+    importPosition: number, 
+    importSize: number, 
+    parentModule: string,
+    module: string,
 }
