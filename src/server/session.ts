@@ -1596,8 +1596,8 @@ export class Session<TMessage = string> implements EventSender {
     
             // Store the mapping position for this module
             mapping.push({
-                module: moduleFile.toLocaleLowerCase(),
-                parentModule: parentModule?.toLocaleLowerCase() || "",
+                module: moduleFile,
+                parentModule: parentModule || "",
                 resolvedModulePosition: position,
                 resolvedModuleSize: content.length,
                 importSize: importSize,
@@ -3537,7 +3537,7 @@ export class Session<TMessage = string> implements EventSender {
             }
     
             function getBundlePosition(mapping: BundleMapping[], sourceFile: NormalizedPath, sourcePosition: number): number {
-                const target = mapping.find(m => m.module === sourceFile.toLocaleLowerCase())!;
+                const target = mapping.find(m => m.module === sourceFile)!;
                 _this.logger.info("$$$getBundlePosition target: " + JSON.stringify(target));
                 const dependenciesUnderPosition = mapping.filter(m => m.parentModule === target.module && m.importPosition < sourcePosition);
                 _this.logger.info("$$$getBundlePosition dependenciesUnderPosition: " + JSON.stringify(dependenciesUnderPosition));
