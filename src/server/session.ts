@@ -1543,7 +1543,52 @@ export class Session<TMessage = string> implements EventSender {
         };
     }
 
-    private createBundleFile(sourceFile: string): { bundleFile: NormalizedPath, mapping: BundleMapping[], disposeBundleInfo: () => void, bundleInfo: ScriptInfo } {
+    private shiftSourceLocation(location: protocol.Location, bundleInfo: ScriptInfo, mapping: BundleMapping[]): {location: protocol.Location, file: NormalizedPath} {
+        const position = this.getPosition(location, bundleInfo) + 2; // 2 - \r\n
+        const {position: moduleResponsePosition, module } = this.getSourcePosition(mapping, position);
+        const moduleInfo = this.getScriptInfoFromProjectService(module);
+        const moduleContent = (moduleInfo.getSnapshot()).getText(0, (moduleInfo.getSnapshot()).getLength());    
+
+        const moduleLocation = getLineAndCharacterOfPosition(createSourceFile(module, moduleContent, ScriptTarget.Latest), moduleResponsePosition);
+        moduleLocation.character += 1;
+        moduleLocation.line += 1;
+
+        return {
+            location: {
+                line: moduleLocation.line,
+                offset: moduleLocation.character - 2, // 2 - \r\n
+            },
+            file: module
+        }
+    }
+
+    private getBundlePosition(mapping: BundleMapping[], sourceFile: NormalizedPath, sourcePosition: number): number {
+        const target = mapping.find(m => m.module.toLocaleLowerCase() === sourceFile.toLocaleLowerCase())!;
+        const dependenciesUnderPosition = mapping.filter(m => m.parentModule === target.module && m.importPosition < sourcePosition);
+        let shiftBundlePosition = 0;
+        dependenciesUnderPosition.forEach(d => {
+            shiftBundlePosition = shiftBundlePosition - d.importSize + d.resolvedModuleSize;
+        });
+        const bundlePosition = sourcePosition + shiftBundlePosition + 2; // 2 - \r\n
+        return bundlePosition;
+    }
+
+    private getSourcePosition(mapping: BundleMapping[], bundlePosition: number): {position: number, module: NormalizedPath} {
+        let shiftSourcePosition = 0;
+
+        const dependenciesAroundPosition = mapping.filter(m => m.resolvedModulePosition < bundlePosition && m.resolvedModulePosition + m.resolvedModuleSize > bundlePosition);
+
+        const targetSourceFile = dependenciesAroundPosition.sort((d1, d2) => (d1.resolvedModulePosition + d1.resolvedModuleSize) - (d2.resolvedModulePosition + d2.resolvedModuleSize))[0];
+        shiftSourcePosition = shiftSourcePosition - targetSourceFile.resolvedModulePosition;
+
+        const dependenciesUnderTargetSourceFilePosition = mapping.filter(d => d.parentModule === targetSourceFile.module && d.resolvedModulePosition + d.resolvedModuleSize < bundlePosition);
+        dependenciesUnderTargetSourceFilePosition.forEach(d => shiftSourcePosition = shiftSourcePosition - d.resolvedModuleSize + d.importSize);
+        
+        const sourcePosition = bundlePosition + shiftSourcePosition;
+        return {position: sourcePosition, module: toNormalizedPath(targetSourceFile.module)};
+    }
+
+    private createBundleFile(sourceFile: string): { bundleFile: NormalizedPath, mapping: BundleMapping[], bundleInfo: ScriptInfo } {
         const _this = this;
         const sourceFilePath = toNormalizedPath(sourceFile);
         const dependenciesSet: NormalizedPath[] = [];
@@ -1565,7 +1610,7 @@ export class Session<TMessage = string> implements EventSender {
         bundleInfo.editContent(0, (bundleInfo.getSnapshot()).getLength(), bundleContent);
         
         const project = this.projectService.getDefaultProjectForFile(sourceFilePath, true)!;
-        project.addRoot(bundleInfo);
+        // project.addRoot(bundleInfo);
     
         function resolveModulesContent(moduleFile: NormalizedPath, position: number, importSize: number, importPosition: number, parentModule?: NormalizedPath): string {
             if (dependenciesSet.some(d => d === moduleFile)) return "/".repeat(importSize);
@@ -1633,20 +1678,11 @@ export class Session<TMessage = string> implements EventSender {
                     const moduleName = (node.moduleSpecifier as StringLiteral).text;
                     let resolvedModule = resolveModuleName(moduleName, moduleFile, project.getCompilerOptions(), _this.projectService.host as ModuleResolutionHost).resolvedModule;
 
-                    const nodeText = node.getText();
-
                     if (!resolvedModule) {
+                        const nodeText = node.getText();
                         const normilizeModuleName = nodeText.replace(/(?<=[^\\])\\(?=[^\\])/g, "/").match(/(?<=import (['"])).+?(?=\1)/)![0];
-                        _this.logger.info("$$$ normilizeModuleName: " + normilizeModuleName);
                         resolvedModule = resolveModuleName(normilizeModuleName, moduleFile, project.getCompilerOptions(), _this.projectService.host as ModuleResolutionHost).resolvedModule;
-                        _this.logger.info("$$$ resolvedModule: " + resolvedModule);
                     }
-
-                    // _this.logger.info(
-                    //     "$$$ moduleName: " + moduleName
-                    //   + " $$$ resolvedModule: " + resolvedModule
-                    //   + " $$$ getText: " + nodeText
-                    // );
     
                     if (resolvedModule) dependencies.push({
                         moduleFile: toNormalizedPath(resolvedModule.resolvedFileName),
@@ -1662,7 +1698,7 @@ export class Session<TMessage = string> implements EventSender {
             return dependencies;
         }
     
-        return { bundleFile, mapping, disposeBundleInfo: () => project.removeFile(bundleInfo, true, true), bundleInfo };
+        return { bundleFile, mapping, bundleInfo };
     }
     
     private findSourceDefinition(args: protocol.FileLocationRequestArgs): readonly protocol.DefinitionInfo[] {
@@ -3439,42 +3475,33 @@ export class Session<TMessage = string> implements EventSender {
         },
         [protocol.CommandTypes.Definition]: (request: protocol.DefinitionRequest) => {
             const response = this.getDefinition(request.arguments, /*simplifiedResult*/ true);
-            this.logger.info("||| Definition: " + JSON.stringify(response))
+            // this.logger.info("||| Definition: " + JSON.stringify(response))
             return this.requiredResponse(response);
         },
         [protocol.CommandTypes.DefinitionFull]: (request: protocol.DefinitionRequest) => {
             const response = this.getDefinition(request.arguments, /*simplifiedResult*/ false);
-            this.logger.info("||| DefinitionFull: " + JSON.stringify(response))
+            // this.logger.info("||| DefinitionFull: " + JSON.stringify(response))
             return this.requiredResponse(response);
         },
         [protocol.CommandTypes.DefinitionAndBoundSpan]: (request: protocol.DefinitionAndBoundSpanRequest) => {
-            const response = this.getDefinitionAndBoundSpan(request.arguments, /*simplifiedResult*/ true);
-            this.logger.info("||| DefinitionAndBoundSpan: " + JSON.stringify(response))
-            return this.requiredResponse(response);
-        },
-        [protocol.CommandTypes.DefinitionAndBoundSpanFull]: (request: protocol.DefinitionAndBoundSpanRequest) => {
-            const response = this.getDefinitionAndBoundSpan(request.arguments, /*simplifiedResult*/ false);
-            this.logger.info("||| DefinitionAndBoundSpanFull: " + JSON.stringify(response))
-            return this.requiredResponse(response);
-        },
-        [protocol.CommandTypes.FindSourceDefinition]: (request: protocol.FindSourceDefinitionRequest) => {
-            const _this = this;
+            let response = this.getDefinitionAndBoundSpan(request.arguments, /*simplifiedResult*/ true);
+
+            if (response.definitions?.length) {
+                return this.requiredResponse(response);
+            }
+
             // бандл файл (зарезолвенный исходный файл)
-            const { bundleFile, mapping, bundleInfo, disposeBundleInfo } = this.createBundleFile(request.arguments.file);
-            this.logger.info("||| mapping: " + JSON.stringify(mapping));
+            const { bundleFile, mapping, bundleInfo } = this.createBundleFile(request.arguments.file);
             const bundleContent = (bundleInfo.getSnapshot()).getText(0, (bundleInfo.getSnapshot()).getLength());    
-            this.logger.info("||| bundleContent:\r\n" + bundleContent);
         
             // исходный файл
             const sourceInfo = this.getScriptInfoFromProjectService(request.arguments.file);
         
             // Получение позиции в исходном файле
             const sourceRequestPosition = this.getPosition(request.arguments, sourceInfo);;
-            this.logger.info("||| sourceRequestPosition: " + JSON.stringify(sourceRequestPosition));
         
             // Получение позиции в бандле
-            const bundleRequestPosition = getBundlePosition(mapping, toNormalizedPath(sourceInfo.path), sourceRequestPosition);
-            this.logger.info("||| bundleRequestPosition: " + JSON.stringify(bundleRequestPosition));
+            const bundleRequestPosition = this.getBundlePosition(mapping, toNormalizedPath(sourceInfo.path), sourceRequestPosition);
         
             const bundleRequestLineAndCharacter = getLineAndCharacterOfPosition(createSourceFile(bundleFile, bundleContent, ScriptTarget.Latest), bundleRequestPosition);
             bundleRequestLineAndCharacter.character += 1;
@@ -3487,91 +3514,74 @@ export class Session<TMessage = string> implements EventSender {
                 offset: request.arguments.offset,
                 projectFileName: request.arguments.projectFileName
             };
-            this.logger.info("||| bundleRequestArguments: " + JSON.stringify(bundleRequestArguments));
 
-            const bundleDefinitions = this.findSourceDefinition(bundleRequestArguments);
-            this.logger.info("||| bundleDefinitions: " + JSON.stringify(bundleDefinitions));
+            response = this.getDefinitionAndBoundSpan(bundleRequestArguments, /*simplifiedResult*/ true);
             
-            bundleDefinitions.forEach(d => {
-                _this.logger.info("$$$bundleDefinitions d: " + JSON.stringify(d));
-                const startLocationInfo = shiftSourceLocation(d.start);
+            (response.definitions as readonly protocol.DefinitionInfo[])?.forEach(d => {
+                const startLocationInfo = this.shiftSourceLocation(d.start, bundleInfo, mapping);
                 if (d.file === bundleFile) {
                     d.file = startLocationInfo.file;
                     d.start = startLocationInfo.location;
-                    d.end = shiftSourceLocation(d.end).location;
-                    if (d.contextEnd) d.contextEnd = shiftSourceLocation(d.contextEnd).location;
-                    if (d.contextStart) d.contextStart = shiftSourceLocation(d.contextStart).location;
+                    d.end = this.shiftSourceLocation(d.end, bundleInfo, mapping).location;
+                    if (d.contextEnd) d.contextEnd = this.shiftSourceLocation(d.contextEnd, bundleInfo, mapping).location;
+                    if (d.contextStart) d.contextStart = this.shiftSourceLocation(d.contextStart, bundleInfo, mapping).location;
                 }
             });
-            disposeBundleInfo();
-            this.logger.info("||| bundleDefinitionsInSource: " + JSON.stringify(bundleDefinitions));
 
-            // TODO: filter equal links
-            const response = bundleDefinitions;
-            
-            if (!bundleDefinitions.length) {
-                const nativeDefinitions = this.findSourceDefinition(request.arguments);
-                return this.requiredResponse(nativeDefinitions);
-            }
-
-            function shiftSourceLocation(location: protocol.Location): {location: protocol.Location, file: NormalizedPath} {
-                const position = _this.getPosition(location, bundleInfo) + 2; // 2 - \r\n
-                _this.logger.info("$$$shiftSourceLocation position: " + JSON.stringify(position));
-                const {position: moduleResponsePosition, module } = getSourcePosition(mapping, position);
-                _this.logger.info("$$$shiftSourceLocation moduleResponsePosition: " + JSON.stringify(moduleResponsePosition));
-                const moduleInfo = _this.getScriptInfoFromProjectService(module);
-                const moduleContent = (moduleInfo.getSnapshot()).getText(0, (moduleInfo.getSnapshot()).getLength());    
-    
-                const moduleLocation = getLineAndCharacterOfPosition(createSourceFile(module, moduleContent, ScriptTarget.Latest), moduleResponsePosition);
-                moduleLocation.character += 1;
-                moduleLocation.line += 1;
-                _this.logger.info("$$$shiftSourceLocation moduleLocation: " + JSON.stringify(moduleLocation));
-
-                return {
-                    location: {
-                        line: moduleLocation.line,
-                        offset: moduleLocation.character - 2, // 2 - \r\n
-                    },
-                    file: module
-                }
-            }
-    
-            function getBundlePosition(mapping: BundleMapping[], sourceFile: NormalizedPath, sourcePosition: number): number {
-                const target = mapping.find(m => m.module.toLocaleLowerCase() === sourceFile.toLocaleLowerCase())!;
-                _this.logger.info("$$$getBundlePosition target: " + JSON.stringify(target));
-                const dependenciesUnderPosition = mapping.filter(m => m.parentModule === target.module && m.importPosition < sourcePosition);
-                _this.logger.info("$$$getBundlePosition dependenciesUnderPosition: " + JSON.stringify(dependenciesUnderPosition));
-                let shiftBundlePosition = 0;
-                dependenciesUnderPosition.forEach(d => {
-                    shiftBundlePosition = shiftBundlePosition - d.importSize + d.resolvedModuleSize;
-                    _this.logger.info("$$$getBundlePosition dependenciesUnderPosition.forEach: " + JSON.stringify(d));
-                });
-                _this.logger.info("$$$getBundlePosition shiftBundlePosition: " + JSON.stringify(shiftBundlePosition));
-                const bundlePosition = sourcePosition + shiftBundlePosition + 2; // 2 - \r\n
-                _this.logger.info("$$$getBundlePosition bundlePosition: " + JSON.stringify(bundlePosition));
-                return bundlePosition;
-            }
-
-            function getSourcePosition(mapping: BundleMapping[], bundlePosition: number): {position: number, module: NormalizedPath} {
-                let shiftSourcePosition = 0;
-
-                const dependenciesAroundPosition = mapping.filter(m => m.resolvedModulePosition < bundlePosition && m.resolvedModulePosition + m.resolvedModuleSize > bundlePosition);
-                _this.logger.info("$$$getSourcePosition dependenciesAroundPosition: " + JSON.stringify(dependenciesAroundPosition));
-
-                const targetSourceFile = dependenciesAroundPosition.sort((d1, d2) => (d1.resolvedModulePosition + d1.resolvedModuleSize) - (d2.resolvedModulePosition + d2.resolvedModuleSize))[0];
-                _this.logger.info("$$$getSourcePosition targetSourceFile: " + JSON.stringify(targetSourceFile));
-                shiftSourcePosition = shiftSourcePosition - targetSourceFile.resolvedModulePosition;
-
-                const dependenciesUnderTargetSourceFilePosition = mapping.filter(d => d.parentModule === targetSourceFile.module && d.resolvedModulePosition + d.resolvedModuleSize < bundlePosition);
-                _this.logger.info("$$$getSourcePosition dependenciesUnderTargetSourceFilePosition: " + JSON.stringify(dependenciesUnderTargetSourceFilePosition));
-                dependenciesUnderTargetSourceFilePosition.forEach(d => shiftSourcePosition = shiftSourcePosition - d.resolvedModuleSize + d.importSize);
-                
-                const sourcePosition = bundlePosition + shiftSourcePosition;
-                _this.logger.info("$$$getSourcePosition sourcePosition: " + JSON.stringify(sourcePosition));
-                return {position: sourcePosition, module: toNormalizedPath(targetSourceFile.module)};
-            }
-                        
             return this.requiredResponse(response);
+        },
+        [protocol.CommandTypes.DefinitionAndBoundSpanFull]: (request: protocol.DefinitionAndBoundSpanRequest) => {
+            const response = this.getDefinitionAndBoundSpan(request.arguments, /*simplifiedResult*/ false);
+            // this.logger.info("||| DefinitionAndBoundSpanFull: " + JSON.stringify(response))
+            return this.requiredResponse(response);
+        },
+        [protocol.CommandTypes.FindSourceDefinition]: (request: protocol.FindSourceDefinitionRequest) => {
+            return this.requiredResponse(this.findSourceDefinition(request.arguments));
+            // пока отключил для тестирования простого перехода к определению
+
+            // бандл файл (зарезолвенный исходный файл)
+            const { bundleFile, mapping, bundleInfo } = this.createBundleFile(request.arguments.file);
+            const bundleContent = (bundleInfo.getSnapshot()).getText(0, (bundleInfo.getSnapshot()).getLength());    
+        
+            // исходный файл
+            const sourceInfo = this.getScriptInfoFromProjectService(request.arguments.file);
+        
+            // Получение позиции в исходном файле
+            const sourceRequestPosition = this.getPosition(request.arguments, sourceInfo);;
+        
+            // Получение позиции в бандле
+            const bundleRequestPosition = this.getBundlePosition(mapping, toNormalizedPath(sourceInfo.path), sourceRequestPosition);
+        
+            const bundleRequestLineAndCharacter = getLineAndCharacterOfPosition(createSourceFile(bundleFile, bundleContent, ScriptTarget.Latest), bundleRequestPosition);
+            bundleRequestLineAndCharacter.character += 1;
+            bundleRequestLineAndCharacter.line += 1;
+            
+            const bundleRequestArguments: protocol.FileLocationRequestArgs = {
+                file: bundleFile,
+                line: bundleRequestLineAndCharacter.line,
+                // offset: bundleRequestLineAndCharacter.character, // TODO: отладить, откатиться
+                offset: request.arguments.offset,
+                projectFileName: request.arguments.projectFileName
+            };
+
+            let response = this.findSourceDefinition(bundleRequestArguments);
+            
+            response.forEach(d => {
+                const startLocationInfo = this.shiftSourceLocation(d.start, bundleInfo, mapping);
+                if (d.file === bundleFile) {
+                    d.file = startLocationInfo.file;
+                    d.start = startLocationInfo.location;
+                    d.end = this.shiftSourceLocation(d.end, bundleInfo, mapping).location;
+                    if (d.contextEnd) d.contextEnd = this.shiftSourceLocation(d.contextEnd, bundleInfo, mapping).location;
+                    if (d.contextStart) d.contextStart = this.shiftSourceLocation(d.contextStart, bundleInfo, mapping).location;
+                }
+            });
+
+            if (!response.length) {
+                response = this.findSourceDefinition(request.arguments);
+            }
+
+            return this.requiredResponse(response);            
         },
         [protocol.CommandTypes.EmitOutput]: (request: protocol.EmitOutputRequest) => {
             return this.requiredResponse(this.getEmitOutput(request.arguments));
