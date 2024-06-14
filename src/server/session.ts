@@ -1557,22 +1557,34 @@ export class Session<TMessage = string> implements EventSender {
             ScriptKind.TS
         )!;
         
-        bundleInfo.editContent(0, (bundleInfo.getSnapshot()).getLength(), resolveModulesContent(sourceFilePath, 0, 0, 0));
+        let bundleContent = resolveModulesContent(sourceFilePath, 0, 0, 0);
+        bundleContent = bundleContent.replace(/#sql/g, '`   ');
+        bundleContent = bundleContent.replace(/#text/g, '`    ');
+        bundleContent = bundleContent.replace(/#endtext/g, '`       ');
+        bundleContent = bundleContent.replace(/#endsql/g, '`      ');
+        bundleInfo.editContent(0, (bundleInfo.getSnapshot()).getLength(), bundleContent);
         
         const project = this.projectService.getDefaultProjectForFile(sourceFilePath, true)!;
         project.addRoot(bundleInfo);
     
         function resolveModulesContent(moduleFile: NormalizedPath, position: number, importSize: number, importPosition: number, parentModule?: NormalizedPath): string {
-            if (dependenciesSet.some(d => d === moduleFile)) return "";
+            if (dependenciesSet.some(d => d === moduleFile)) return "/".repeat(importSize);
             dependenciesSet.push(moduleFile);
     
             const sourceInfo = _this.getScriptInfoFromProjectService(moduleFile);
             const dependencies = getDependencies(moduleFile);
-    
+
             let content = (sourceInfo.getSnapshot()).getText(0, (sourceInfo.getSnapshot()).getLength());
             let resolvePositionOffset = 0;
     
             dependencies.sort((a, b) => a.importStartPosition - b.importStartPosition);
+            // подключаем AppGlobalScript по-умолчанию в любом файле
+            dependencies.unshift({
+                moduleFile: toNormalizedPath((_this.projectService.getDefaultProjectForFile(sourceFilePath, true)!).currentDirectory + "/Lib/AppGlobalScript.js"),
+                importStartPosition: 0,
+                importSize: 0,
+            })
+
             for (let dep of dependencies) {
                 const start = dep.importStartPosition + resolvePositionOffset;
                 content = removeSubstring(content, start, dep.importSize);
@@ -1619,7 +1631,22 @@ export class Session<TMessage = string> implements EventSender {
                     const width = node.getWidth();
     
                     const moduleName = (node.moduleSpecifier as StringLiteral).text;
-                    const resolvedModule = resolveModuleName(moduleName, moduleFile, project.getCompilerOptions(), _this.projectService.host as ModuleResolutionHost).resolvedModule;
+                    let resolvedModule = resolveModuleName(moduleName, moduleFile, project.getCompilerOptions(), _this.projectService.host as ModuleResolutionHost).resolvedModule;
+
+                    const nodeText = node.getText();
+
+                    if (!resolvedModule) {
+                        const normilizeModuleName = nodeText.replace(/(?<=[^\\])\\(?=[^\\])/g, "/").match(/(?<=import (['"])).+?(?=\1)/)![0];
+                        _this.logger.info("$$$ normilizeModuleName: " + normilizeModuleName);
+                        resolvedModule = resolveModuleName(normilizeModuleName, moduleFile, project.getCompilerOptions(), _this.projectService.host as ModuleResolutionHost).resolvedModule;
+                        _this.logger.info("$$$ resolvedModule: " + resolvedModule);
+                    }
+
+                    // _this.logger.info(
+                    //     "$$$ moduleName: " + moduleName
+                    //   + " $$$ resolvedModule: " + resolvedModule
+                    //   + " $$$ getText: " + nodeText
+                    // );
     
                     if (resolvedModule) dependencies.push({
                         moduleFile: toNormalizedPath(resolvedModule.resolvedFileName),
@@ -3440,15 +3467,9 @@ export class Session<TMessage = string> implements EventSender {
         
             // исходный файл
             const sourceInfo = this.getScriptInfoFromProjectService(request.arguments.file);
-            const sourceContent = (sourceInfo.getSnapshot()).getText(0, (sourceInfo.getSnapshot()).getLength());    
         
             // Получение позиции в исходном файле
-            // const nativeRequestPosition = this.getPosition(request.arguments, sourceInfo);
-            // this.logger.info("||| nativeRequestPosition: " + JSON.stringify(nativeRequestPosition));
-            // const nativeRequestPosition2 = getPositionOfLineAndCharacter(createSourceFile(request.arguments.file, sourceContent, ScriptTarget.Latest), request.arguments.line, request.arguments.offset);
-            // this.logger.info("||| nativeRequestPosition2: " + JSON.stringify(nativeRequestPosition2));
-            
-            const sourceRequestPosition = customGetPositionOfLineAndCharacter(sourceContent, request.arguments.line, request.arguments.offset);
+            const sourceRequestPosition = this.getPosition(request.arguments, sourceInfo);;
             this.logger.info("||| sourceRequestPosition: " + JSON.stringify(sourceRequestPosition));
         
             // Получение позиции в бандле
@@ -3462,7 +3483,7 @@ export class Session<TMessage = string> implements EventSender {
             const bundleRequestArguments: protocol.FileLocationRequestArgs = {
                 file: bundleFile,
                 line: bundleRequestLineAndCharacter.line,
-                // offset: bundleLineAndCharacter.character,
+                // offset: bundleRequestLineAndCharacter.character, // TODO: отладить, откатиться
                 offset: request.arguments.offset,
                 projectFileName: request.arguments.projectFileName
             };
@@ -3470,8 +3491,7 @@ export class Session<TMessage = string> implements EventSender {
 
             const bundleDefinitions = this.findSourceDefinition(bundleRequestArguments);
             this.logger.info("||| bundleDefinitions: " + JSON.stringify(bundleDefinitions));
-            disposeBundleInfo();
-
+            
             bundleDefinitions.forEach(d => {
                 _this.logger.info("$$$bundleDefinitions d: " + JSON.stringify(d));
                 const startLocationInfo = shiftSourceLocation(d.start);
@@ -3483,12 +3503,19 @@ export class Session<TMessage = string> implements EventSender {
                     if (d.contextStart) d.contextStart = shiftSourceLocation(d.contextStart).location;
                 }
             });
+            disposeBundleInfo();
             this.logger.info("||| bundleDefinitionsInSource: " + JSON.stringify(bundleDefinitions));
 
+            // TODO: filter equal links
             const response = bundleDefinitions;
+            
+            if (!bundleDefinitions.length) {
+                const nativeDefinitions = this.findSourceDefinition(request.arguments);
+                return this.requiredResponse(nativeDefinitions);
+            }
 
             function shiftSourceLocation(location: protocol.Location): {location: protocol.Location, file: NormalizedPath} {
-                const position = customGetPositionOfLineAndCharacter(bundleContent, location.line, location.offset);
+                const position = _this.getPosition(location, bundleInfo) + 2; // 2 - \r\n
                 _this.logger.info("$$$shiftSourceLocation position: " + JSON.stringify(position));
                 const {position: moduleResponsePosition, module } = getSourcePosition(mapping, position);
                 _this.logger.info("$$$shiftSourceLocation moduleResponsePosition: " + JSON.stringify(moduleResponsePosition));
@@ -3503,7 +3530,7 @@ export class Session<TMessage = string> implements EventSender {
                 return {
                     location: {
                         line: moduleLocation.line,
-                        offset: moduleLocation.character,
+                        offset: moduleLocation.character - 2, // 2 - \r\n
                     },
                     file: module
                 }
@@ -3520,7 +3547,7 @@ export class Session<TMessage = string> implements EventSender {
                     _this.logger.info("$$$getBundlePosition dependenciesUnderPosition.forEach: " + JSON.stringify(d));
                 });
                 _this.logger.info("$$$getBundlePosition shiftBundlePosition: " + JSON.stringify(shiftBundlePosition));
-                const bundlePosition = sourcePosition + shiftBundlePosition;
+                const bundlePosition = sourcePosition + shiftBundlePosition + 2; // 2 - \r\n
                 _this.logger.info("$$$getBundlePosition bundlePosition: " + JSON.stringify(bundlePosition));
                 return bundlePosition;
             }
@@ -3543,10 +3570,6 @@ export class Session<TMessage = string> implements EventSender {
                 _this.logger.info("$$$getSourcePosition sourcePosition: " + JSON.stringify(sourcePosition));
                 return {position: sourcePosition, module: toNormalizedPath(targetSourceFile.module)};
             }
-
-            function customGetPositionOfLineAndCharacter(content: string, line: number, character: number): number {
-                return content.split("\r\n").slice(0, line - 1).join("\r\n").length + character + 1;
-            }       
                         
             return this.requiredResponse(response);
         },
