@@ -3537,7 +3537,7 @@ export class Session<TMessage = string> implements EventSender {
             }
     
             function getBundlePosition(mapping: BundleMapping[], sourceFile: NormalizedPath, sourcePosition: number): number {
-                const target = mapping.find(m => m.module === sourceFile)!;
+                const target = mapping.find(m => m.module.toLocaleLowerCase() === sourceFile.toLocaleLowerCase())!;
                 _this.logger.info("$$$getBundlePosition target: " + JSON.stringify(target));
                 const dependenciesUnderPosition = mapping.filter(m => m.parentModule === target.module && m.importPosition < sourcePosition);
                 _this.logger.info("$$$getBundlePosition dependenciesUnderPosition: " + JSON.stringify(dependenciesUnderPosition));
